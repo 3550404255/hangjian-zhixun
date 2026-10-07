@@ -7,13 +7,13 @@ from datetime import datetime
 import time
 from sklearn.ensemble import IsolationForest
 
-st.set_page_config(page_title="航检智巡 V3.3", page_icon="📡", layout="wide")
+st.set_page_config(page_title="航检智巡 V3.5", page_icon="📡", layout="wide")
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "航检智巡_V3_真实参数.csv"
 
-st.title("📡 航检智巡 V3.3")
+st.title("📡 航检智巡 V3.5")
 st.caption("民航导航设施智能巡检与故障辅助诊断系统")
-st.info("V3.3：真实维护数据 + 多参数同步连续仿真 + Isolation Forest 本地异常检测 + 初步故障特征提示。")
+st.info("V3.5：真实维护数据 + 多参数同步连续仿真 + Isolation Forest + 参数单位/工程门限 + 标准化偏离 + 异常等级 + 故障辅助诊断 + AI巡检报告。")
 
 @st.cache_data
 def load_data():
@@ -37,6 +37,24 @@ def judge(v, lo, hi):
         return "暂无门限"
     return "正常" if lo <= v <= hi else "超限"
 
+# 单位补充表：
+# 原始CSV中部分DVOR参数“单位”字段为空，因此这里按参数本身的工程含义补充显示单位。
+# 这些补充单位仅用于界面展示，不改变原始数据和门限。
+UNIT_FALLBACK = {
+    "30Hz调制度": "%",
+    "载波功率": "W",
+    "上边带功率": "W",
+    "下边带功率": "W",
+    "方位准确度": "°",
+    "电池电压": "V",
+}
+
+def get_unit(rows, parameter):
+    raw = rows.iloc[0]["单位"]
+    if not pd.isna(raw) and str(raw).strip():
+        return str(raw).strip()
+    return UNIT_FALLBACK.get(parameter, "—")
+
 def build_stats(device_df):
     out = {}
     num = device_df[device_df["实测数值"].notna()]
@@ -55,7 +73,7 @@ def build_stats(device_df):
             "mean": mean, "std": std,
             "low": float(lo.iloc[0]) if len(lo) else np.nan,
             "high": float(hi.iloc[0]) if len(hi) else np.nan,
-            "unit": "" if pd.isna(rows.iloc[0]["单位"]) else str(rows.iloc[0]["单位"]),
+            "unit": get_unit(rows, p),
             "limit": "未设置" if pd.isna(rows.iloc[0]["门限"]) or str(rows.iloc[0]["门限"]).strip() in ("", "''", "nan") else str(rows.iloc[0]["门限"])
         }
     return out
@@ -65,6 +83,117 @@ def find_param(stats, names):
         if name in stats:
             return name
     return None
+
+
+
+def parameter_abnormality(stats, selected, row):
+    """计算参数相对正常基线的标准化偏离程度，用于解释AI结果。"""
+    result = []
+    for p in selected:
+        s = stats[p]
+        sigma = max(float(s["std"]), abs(float(s["mean"])) * 0.001, 1e-6)
+        z = abs((float(row[p]) - float(s["mean"])) / sigma)
+        result.append({"参数": p, "偏离程度": float(z), "当前值": float(row[p]), "正常均值": float(s["mean"])})
+    return sorted(result, key=lambda x: x["偏离程度"], reverse=True)
+
+
+def abnormal_level(z):
+    """将标准化偏离程度转换为便于展示的异常等级。"""
+    if z >= 3.0:
+        return "高"
+    if z >= 2.0:
+        return "中"
+    if z >= 1.5:
+        return "低"
+    return "正常"
+
+
+def build_abnormal_table(stats, abnormal_params, top_n=8):
+    """
+    生成工程人员更容易理解的异常参数表：
+    实际值 + 单位 + 工程门限 + 相对均值的实际偏差 + σ偏离程度 + 异常等级。
+    """
+    rows = []
+    for x in abnormal_params[:top_n]:
+        p = x["参数"]
+        s = stats[p]
+        current = float(x["当前值"])
+        mean = float(x["正常均值"])
+        delta = current - mean
+
+        if not pd.isna(s["low"]) and not pd.isna(s["high"]):
+            limit_text = f'{s["low"]:.4g} ～ {s["high"]:.4g} {s["unit"]}'.strip()
+        else:
+            limit_text = "未设置"
+
+        rows.append({
+            "参数": p,
+            "当前值": round(current, 4),
+            "单位": s["unit"] if s["unit"] else "—",
+            "基线均值": round(mean, 4),
+            "实际偏差": round(delta, 4),
+            "工程门限": limit_text,
+            "偏离程度": round(float(x["偏离程度"]), 2),
+            "异常等级": abnormal_level(float(x["偏离程度"]))
+        })
+
+    return pd.DataFrame(rows)
+
+
+def auxiliary_diagnosis(device, abnormal_params):
+    """基于观测到的参数偏离程度给出辅助诊断，不直接读取仿真场景。"""
+    names = [x["参数"] for x in abnormal_params if x["偏离程度"] >= 2.0]
+
+    if device == "DME":
+        if any("延迟" in n for n in names) and any(
+            k in n for n in names for k in ["解码", "TX脉冲率", "间隔"]
+        ):
+            return "疑似应答时序/处理链路异常", "较高", (
+                f"检测到 {'、'.join(names)} 出现协同偏离，建议重点检查应答处理、时序及相关接口链路。"
+            )
+        if any("功率" in n for n in names) and any("效率" in n for n in names):
+            return "疑似发射链路异常", "较高", (
+                f"检测到 {'、'.join(names)} 同时偏离正常基线，建议重点检查发射链路及功率相关模块。"
+            )
+        wave = [any(k in n for k in ["脉冲宽度", "脉冲上升时间", "脉冲下降时间"]) for n in names]
+        if sum(wave) >= 2:
+            return "疑似脉冲波形异常", "较高", (
+                f"检测到多个脉冲波形参数同时偏离（{'、'.join(names)}），建议检查脉冲形成及波形相关链路。"
+            )
+    else:
+        if any("调制度" in n for n in names):
+            return "疑似调制相关异常", "中", (
+                f"检测到 {'、'.join(names)} 明显偏离，建议重点检查调制相关链路。"
+            )
+        power = [any(k in n for k in ["载波功率", "上边带功率", "下边带功率"]) for n in names]
+        if sum(power) >= 2:
+            return "疑似发射功率相关异常", "较高", (
+                f"检测到载波/边带功率联动偏离（{'、'.join(names)}），建议检查发射功率相关链路。"
+            )
+        if any("方位准确度" in n for n in names):
+            return "疑似方位性能异常", "中", (
+                "检测到方位准确度明显偏离，建议检查方位相关链路。"
+            )
+
+    if len(names) >= 2:
+        return "疑似多参数综合异常", "中", (
+            f"多个参数同时偏离正常基线（{'、'.join(names)}），建议结合维护记录进一步排查。"
+        )
+    if names:
+        return "疑似单参数异常", "中", (
+            f"主要异常参数为 {names[0]}，建议结合门限、历史趋势及维护记录进一步确认。"
+        )
+    return "暂未发现明显故障特征", "低", "当前数据与正常运行基线较为接近。"
+
+
+
+def build_report(device, ai_state, ai_score, diagnosis, confidence, explanation, abnormal_params):
+    top = abnormal_params[:3]
+    top_text = "；".join(f"{x['参数']}（偏离{x['偏离程度']:.2f}σ）" for x in top) if top else "无明显异常参数"
+    return (f"设备：{device}\n总体状态：{ai_state}\nAI异常分数：{ai_score:.4f}\n"
+            f"辅助诊断：{diagnosis}\n诊断置信程度：{confidence}\n"
+            f"主要异常参数：{top_text}\n分析说明：{explanation}\n"
+            "说明：本报告用于智能巡检辅助分析，不替代专业检测规程和最终故障判定。")
 
 def make_iforest_model(stats, selected, samples=300):
     """
@@ -124,8 +253,8 @@ def ai_result(model, stats, selected, row):
     return "正常", score, "Isolation Forest判定：当前点位于正常数据分布附近"
 
 
-def make_standard_iforest_model(stats, selected, samples=400):
-    """在标准化空间训练 Isolation Forest，解决频率/功率/延迟等量纲不同的问题。"""
+def make_standard_iforest_model(stats, selected, samples=600):
+    """建立标准化正常基线，并用训练分数分位点校准异常阈值。"""
     if not selected:
         return None
 
@@ -139,12 +268,19 @@ def make_standard_iforest_model(stats, selected, samples=400):
             row.append((value - float(s["mean"])) / sigma)
         X.append(row)
 
+    X = np.asarray(X, dtype=float)
     model = IsolationForest(
-        n_estimators=150,
-        contamination=0.06,
+        n_estimators=200,
+        contamination="auto",
         random_state=42
     )
-    model.fit(np.asarray(X, dtype=float))
+    model.fit(X)
+
+    # 用正常基线自身的得分校准阈值，避免不同参数维度下出现
+    # “正常仿真点大面积被判异常”的问题。
+    train_scores = model.decision_function(X)
+    threshold = float(np.percentile(train_scores, 3))
+    model._hjzj_threshold = threshold
     return model
 
 
@@ -159,13 +295,24 @@ def ai_predict(model, stats, selected, row):
         x.append((float(row[p]) - float(s["mean"])) / sigma)
 
     x = np.asarray(x, dtype=float).reshape(1, -1)
-    pred = int(model.predict(x)[0])
     score = float(model.decision_function(x)[0])
+    threshold = float(getattr(model, "_hjzj_threshold", 0.0))
+    max_z = float(np.max(np.abs(x)))
 
-    if pred == -1:
-        level = "高" if score < -0.12 else ("中" if score < 0 else "低")
-        return "异常", score, f"疑似异常（{level}）"
-    return "正常", score, "正常"
+    # Isolation Forest 负责联合分布检测；最大标准化偏离作为第二道保险。
+    # 这样可以避免“单个关键参数已经明显越界，但树模型没有及时隔离”的情况。
+    is_anomaly = (score < threshold) or (max_z >= 3.0)
+
+    if is_anomaly:
+        if max_z >= 5.0 or score < threshold - 0.08:
+            level = "高"
+        elif max_z >= 3.0 or score < threshold - 0.03:
+            level = "中"
+        else:
+            level = "低"
+        return "异常", score, f"疑似异常（{level}，最大参数偏离 {max_z:.2f}σ）"
+    return "正常", score, f"正常（最大参数偏离 {max_z:.2f}σ）"
+
 
 
 device = st.sidebar.selectbox("选择导航设备", ["DVOR", "DME"])
@@ -277,6 +424,8 @@ elif mode == "多参数连续仿真":
         # 本地 Isolation Forest：不调用网络、不需要付费API。
         ai_model = make_standard_iforest_model(stats, selected)
         ai_status_box = st.empty()
+        ai_diag_box = st.empty()
+        ai_rank_box = st.empty()
         progress = st.progress(0)
         status_box = st.empty()
         chart_box = st.empty()
@@ -292,20 +441,29 @@ elif mode == "多参数连续仿真":
                 active = p in scenario_map[scenario]
 
                 if active and scenario != "正常运行":
-                    # 渐进漂移；使用门限中点决定向哪边推
-                    if not pd.isna(s["low"]) and not pd.isna(s["high"]):
-                        mid = (s["low"] + s["high"]) / 2
-                        direction = 1 if s["mean"] < mid else -1
+                    # 渐进异常注入：优先把数值推向门限外，保证仿真场景
+                    # 与“正常运行”在观测特征上有明显区别。
+                    lo, hi = s["low"], s["high"]
+                    if not pd.isna(lo) and not pd.isna(hi) and hi > lo:
+                        margin = max((hi - lo) * 0.15, s["std"] * severity)
+                        if s["mean"] <= (lo + hi) / 2:
+                            target = hi + margin
+                        else:
+                            target = lo - margin
+                        value = value * (1 - t) + target * t
                     else:
-                        direction = 1
-                    value += direction * s["std"] * severity * t
+                        direction = 1 if np.random.random() >= 0.5 else -1
+                        value += direction * s["std"] * severity * 1.5 * t
 
                 row[p] = value
 
             # Isolation Forest：把不同单位参数标准化后进行联合异常检测。
             ai_state, ai_score, ai_text = ai_predict(ai_model, stats, selected, row)
+            abnormal_params = parameter_abnormality(stats, selected, row)
+            diagnosis, confidence, explanation = auxiliary_diagnosis(device, abnormal_params)
             row["AI异常状态"] = ai_state
             row["AI异常分数"] = ai_score
+            row["辅助诊断"] = diagnosis
 
             hist.append(row)
             ai_hist.append({
@@ -341,6 +499,22 @@ elif mode == "多参数连续仿真":
                     f"🤖 AI异常检测：{ai_text} | 分数：{ai_score:.4f}"
                 )
 
+            ai_diag_box.info(f"🔎 辅助诊断：{diagnosis}｜置信程度：{confidence}\n\n分析说明：{explanation}")
+            top3 = abnormal_params[:8]
+            rank_text = "；".join(
+                f"{i+1}. {x['参数']}：{x['偏离程度']:.2f}σ"
+                for i, x in enumerate(top3)
+            ) if top3 else "暂无"
+            ai_rank_box.caption(f"📊 当前异常参数排名：{rank_text}")
+
+            # 工程化展示：每个参数单独列出实际单位，同时保留σ标准化偏离程度。
+            detail_table = build_abnormal_table(stats, abnormal_params, top_n=8)
+            ai_rank_box.dataframe(
+                detail_table,
+                use_container_width=True,
+                hide_index=True
+            )
+
             # 图表只显示数值参数，避免把AI文字列混入折线图。
             chart_data = live[[p for p in selected if p in live.columns]]
             chart_box.line_chart(chart_data)
@@ -357,40 +531,34 @@ elif mode == "多参数连续仿真":
         st.session_state.v32_history = pd.DataFrame(hist)
         st.session_state.v33_ai_history = pd.DataFrame(ai_hist)
 
-        # 初步规则提示：只根据真实表里存在的参数做判断
+        # 最终故障特征提示：与AI异常检测采用同一份“异常参数排名”逻辑，
+        # 避免出现“AI判定异常很多，但故障提示仍显示正常”的信息冲突。
         final = st.session_state.v32_history.iloc[-1]
-        hints = []
-
-        def out_of_limit(p):
-            if not p or p not in final.index:
-                return False
-            s = stats[p]
-            return not pd.isna(s["low"]) and not pd.isna(s["high"]) and not (s["low"] <= final[p] <= s["high"])
-
-        if device == "DME":
-            if out_of_limit(names["delay"]):
-                hints.append("应答延迟偏离原始门限，建议检查应答时序相关链路。")
-            if out_of_limit(names["power"]) and out_of_limit(names["eff"]):
-                hints.append("射频功率与效率同时异常，建议重点检查发射链路。")
-            wave = [out_of_limit(names[k]) for k in ["width","rise","fall"]]
-            if sum(wave) >= 2:
-                hints.append("多个脉冲波形参数同时异常，建议检查脉冲形成/波形相关链路。")
-        else:
-            if out_of_limit(names["mod"]):
-                hints.append("30Hz调制度偏离原始门限，建议检查调制相关链路。")
-            power = [out_of_limit(names[k]) for k in ["carrier","upper","lower"]]
-            if sum(power) >= 2:
-                hints.append("载波/边带功率出现联动异常，建议检查发射功率相关链路。")
-            if out_of_limit(names["azimuth"]):
-                hints.append("方位准确度偏离原始门限，建议检查方位相关链路。")
+        final_abnormal = parameter_abnormality(stats, selected, final)
+        final_diag, final_conf, final_explain = auxiliary_diagnosis(device, final_abnormal)
 
         st.divider()
         st.subheader("🧠 初步故障特征提示")
-        if hints:
-            for h in hints:
-                st.warning(h)
+        top_final = final_abnormal[:8]
+        if top_final and top_final[0]["偏离程度"] >= 2.0:
+            st.warning(
+                f"检测到主要异常参数："
+                + "、".join(f"{x['参数']}（{x['偏离程度']:.2f}σ）" for x in top_final[:3])
+            )
+            st.info(f"辅助诊断：{final_diag}｜置信程度：{final_conf}\n\n{final_explain}")
+
+            st.markdown("#### 📊 异常参数工程化明细")
+            st.caption(
+                "当前值和实际偏差保留原始工程单位；“偏离程度”采用σ表示，"
+                "用于消除不同参数量纲差异，便于跨参数比较。"
+            )
+            st.dataframe(
+                build_abnormal_table(stats, final_abnormal, top_n=8),
+                use_container_width=True,
+                hide_index=True
+            )
         else:
-            st.success("当前仿真末端没有形成明确的多参数异常组合。")
+            st.success("当前仿真末端未发现达到辅助诊断阈值的明显异常参数。")
 
         st.success(f"本次仿真完成，共生成 {n} 个同步采样点。")
 
@@ -415,6 +583,14 @@ elif mode == "多参数连续仿真":
                 "说明：Isolation Forest 使用当前设备维护数据的均值和波动范围构建本地正常基线，"
                 "再对多参数联合状态进行无监督异常检测。当前版本用于仿真验证，不替代真实设备检测规程。"
             )
+            st.subheader("📝 AI巡检报告")
+            last = st.session_state.v32_history.iloc[-1]
+            last_ai = st.session_state.v33_ai_history.iloc[-1]
+            last_abnormal = parameter_abnormality(stats, selected, last)
+            last_diag, last_conf, last_explain = auxiliary_diagnosis(device, last_abnormal)
+            report = build_report(device, str(last_ai["AI异常状态"]), float(last_ai["AI异常分数"]), last_diag, last_conf, last_explain, last_abnormal)
+            st.text_area("当前巡检摘要", report, height=220)
+            st.download_button("⬇️ 导出AI巡检报告（TXT）", data=report.encode("utf-8"), file_name=f"航检智巡_{device}_AI巡检报告.txt", mime="text/plain", use_container_width=True)
 
     if not st.session_state.v32_history.empty:
         st.divider()
@@ -428,4 +604,4 @@ else:
     st.dataframe(show, use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption("航检智巡 V3.3 | 数据基础：用户提供的 VORDME 设备维护参数表 | AI：本地 Isolation Forest")
+st.caption("航检智巡 V3.5 | 数据基础：用户提供的 DVOR/DME 设备维护参数表 | AI：本地 Isolation Forest")
